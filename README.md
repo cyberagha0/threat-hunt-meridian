@@ -1,4 +1,6 @@
-# Threat Hunt: Autonomous LLM Agent Breach of a Notebook Host
+# 🔍 Autonomous LLM Agent Compromise — Microsoft Sentinel Threat Hunt
+
+### 🛡️ Threat Hunting Investigation | LLM Security | Microsoft Sentinel
 
 **Hunt:** Meridian (Hunt 25) · **Platform:** Microsoft Sentinel · **Workspace:** `law-huntpractice`
 **Window:** 2026-09-04, 11:05:02 – 11:57:00 UTC · **Elapsed:** 51 min 57 sec
