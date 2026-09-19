@@ -1,0 +1,342 @@
+// =====================================================================
+// Threat Hunt: Autonomous LLM Agent Breach of a Notebook Host
+// Platform:  Microsoft Sentinel
+// Workspace: law-huntpractice
+// Window:    2026-09-04 11:05:02 - 11:57:00 UTC
+// Analyst:   Tural Aghabalayev
+//
+// Ordered to follow the attack chain. These are the queries that
+// produced the screenshots in the README.
+//
+// SCHEMA NOTES
+//   LinuxProcess_CL / LinuxNetwork_CL / LinuxAuth_CL -> Dvc, EventStartTime
+//   Everything else                                  -> Computer, TimeGenerated
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// PHASE 1 - INITIAL ACCESS  (T1190, T1059.006)
+// ---------------------------------------------------------------------
+
+// 1.1 Wide sweep for protocol upgrades - HTTP 101 is the tell
+ApacheAccess_CL
+| where TimeGenerated >= datetime(2026-09-02 00:00:00)
+| where TimeGenerated <= datetime(2026-09-15 23:59:59)
+| where HttpStatus == 101
+| project TimeGenerated, Computer, ClientIP, HttpMethod, UriStem, HttpStatus
+| order by TimeGenerated asc
+
+
+// 1.2 Narrow to the marimo kernel endpoint
+ApacheAccess_CL
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where HttpStatus == 101
+| where HttpMethod == "GET"
+| where UriStem == "/ws/kernel"
+| project TimeGenerated, Computer, ClientIP, HttpMethod, UriStem, HttpStatus
+| order by TimeGenerated asc
+
+
+// 1.3 Full process timeline across the estate
+LinuxProcess_CL
+| where EventStartTime between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where Dvc contains "gf-tg"
+| project EventStartTime, Dvc, TargetProcessName, TargetProcessId,
+          TargetProcessCommandLine, ActingProcessName, ActingProcessId, ActingProcessCommandLine
+| order by EventStartTime asc
+
+
+// 1.4 python3.12 runs 74 times here. Group by parent to find the one.
+//     bash 72 | systemd 1 | marimo 1  <- the last one is the attacker
+LinuxProcess_CL
+| where EventStartTime between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where Dvc == "gf-tg-nb01"
+| where TargetProcessName == "python3.12"
+| summarize Count = count() by ActingProcessName, ActingProcessCommandLine
+| order by Count desc
+
+
+// 1.5 The agent names the CVE in its own reasoning BEFORE exploiting
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where tostring(model_response) contains "CVE-"
+   or tostring(user_input)  contains "CVE-"
+   or tostring(tool_args)   contains "CVE-"
+| project TimeGenerated, RunId, actor, session_id, user_input, model_response, tool_name, tool_args
+| order by TimeGenerated asc
+
+
+// ---------------------------------------------------------------------
+// PHASE 2 - CREDENTIAL ACCESS  (T1552.005 / ATLAS AML.T0098)
+// ---------------------------------------------------------------------
+
+// 2.1 Which identities called AWS in the window, and from where
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where isnotempty(UserIdentityArn)
+| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Calls = count(),
+            AccessKeys = make_set(UserIdentityAccessKeyId),
+            SourceIPs  = make_set(SourceIpAddress),
+            Actions    = make_set(EventName)
+    by UserIdentityArn
+| order by FirstSeen asc
+
+
+// 2.2 Who actually owned the IMDS socket?
+//     refresh 84 (credential-helper daemon) | python3.12 1 (the attacker)
+LinuxNetwork_CL
+| where EventStartTime between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where DstIpAddr == "169.254.169.254"
+| summarize Count = count() by ActingProcessName
+| order by Count desc
+
+
+// ---------------------------------------------------------------------
+// PHASE 3 - DEFENSE EVASION  (T1090.003, T1526)
+// ---------------------------------------------------------------------
+
+// 3.1 One access key behind every Secrets Manager call
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where EventSource == "secretsmanager.amazonaws.com"
+| summarize Calls = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+            SourceIPs = make_set(SourceIpAddress), Actions = make_set(EventName)
+    by UserIdentityAccessKeyId
+| order by Calls desc
+
+
+// 3.2 The full sequence - throttle at 11:22:41 (.71), retry at 11:23:05 (.94)
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 11:00:00) .. datetime(2026-09-04 11:40:00))
+| where UserIdentityAccessKeyId == "AKIA4TIDEGLASS0EXAMPLE"
+| project TimeGenerated, EventSource, EventName, SourceIpAddress, ErrorCode, RequestParameters
+| order by TimeGenerated asc
+
+
+// 3.3 Count the egress pool - 6 addresses, in order of first appearance
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 11:00:00) .. datetime(2026-09-04 11:40:00))
+| where EventSource == "secretsmanager.amazonaws.com"
+| where UserIdentityAccessKeyId == "AKIA4TIDEGLASS0EXAMPLE"
+| summarize FirstSeen = min(TimeGenerated) by SourceIpAddress
+| order by FirstSeen asc
+
+
+// ---------------------------------------------------------------------
+// PHASE 4 - COLLECTION  (T1555.006, T1552.001 / ATLAS AML.T0086)
+// ---------------------------------------------------------------------
+
+// 4.1 Recon vs theft - seven ReadOnly=true, then one false
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 11:00:00) .. datetime(2026-09-04 11:40:00))
+| where EventSource == "secretsmanager.amazonaws.com"
+| where UserIdentityAccessKeyId == "AKIA4TIDEGLASS0EXAMPLE"
+| project TimeGenerated, EventName, ReadOnly, SourceIpAddress, ErrorCode
+| order by TimeGenerated asc
+
+
+// 4.2 The theft call in detail
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:35:00))
+| where EventName == "GetSecretValue"
+| project TimeGenerated, SourceIpAddress, UserIdentityAccessKeyId, UserIdentityArn, ReadOnly
+| order by TimeGenerated asc
+
+
+// 4.3 The agent's reasoning about that specific secret
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:35:00))
+| where tostring(model_response) contains "prod/bastion/ssh-deploy-key"
+   or tostring(tool_args)   contains "prod/bastion/ssh-deploy-key"
+   or tostring(tool_result) contains "prod/bastion/ssh-deploy-key"
+| project TimeGenerated, session_id, actor, model_response, tool_name, tool_args, tool_result
+| order by TimeGenerated asc
+
+
+// 4.4 Wider agent context across the credential phase
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:35:00))
+| extend AllText = strcat(tostring(user_input), " ", tostring(model_response), " ",
+                          tostring(tool_name), " ", tostring(tool_args), " ", tostring(tool_result))
+| where AllText has_any ("GetSecretValue", "SecretId", "postgres", "password", "credential", "db", "prod/")
+| project TimeGenerated, RunId, actor, AllText
+| order by TimeGenerated asc
+
+
+// 4.5 THE VISIBILITY GAP - ResponseElements never carries secret material
+AWSCloudTrail
+| where TimeGenerated between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:35:00))
+| where EventSource == "secretsmanager.amazonaws.com"
+| where EventName == "GetSecretValue"
+| project TimeGenerated, EventName, RequestParameters, ResponseElements, ErrorCode
+
+
+// ---------------------------------------------------------------------
+// PHASE 5 - LATERAL MOVEMENT  (T1021.004, T1078.004)
+// ---------------------------------------------------------------------
+
+// 5.1 Stolen secret becomes a file - chmod 600 /tmp/.c/id_ed25519
+LinuxShellHistory_CL
+| where TimeGenerated between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:40:00))
+| where Command has_any ("ssh", "authorized_keys", "id_rsa", "chmod", "echo", "cat", "tee")
+| project TimeGenerated, Computer, ShellUser, Command
+| order by TimeGenerated asc
+
+
+// 5.2 Baseline: successful publickey logins from named human admins
+LinuxAuth_CL
+| where EventStartTime between (datetime(2026-09-04 11:25:00) .. datetime(2026-09-04 11:40:00))
+| where EventResult =~ "Success"
+| project EventStartTime, Dvc, TargetUsername, EventOriginalMessage
+| order by EventStartTime asc
+
+
+// 5.3 The auth method is shared. The ACCOUNT NAME is the outlier.
+//     p.reyes 90 | h.nakamura 78 | o.diallo 77 | l.brandt 72 | deploy 1
+LinuxAuth_CL
+| where EventStartTime between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where Dvc == "gf-tg-bastion01"
+| where EventResult == "Success"
+| summarize Count = count() by TargetUsername
+| order by Count desc
+
+
+// 5.4 The shareable indicator - sshd's recorded key fingerprint
+LinuxAuth_CL
+| where EventStartTime between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 11:38:00))
+| where Dvc == "gf-tg-bastion01"
+| where TargetUsername == "deploy"
+| where EventResult == "Success"
+| project EventStartTime, TargetUsername, EventOriginalMessage
+
+
+// ---------------------------------------------------------------------
+// PHASE 6 - DISCOVERY AND EXFILTRATION  (T1046, T1213, T1005)
+// ---------------------------------------------------------------------
+
+// 6.1 Database enumeration - sizing up the target
+LinuxShellHistory_CL
+| where TimeGenerated between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 12:00:00))
+| where Computer == "gf-tg-bastion01"
+| where Command has_any ("psql", "postgres", "\\l", "\\dt", "pg_dump", "SELECT")
+| project TimeGenerated, Computer, ShellUser, Command
+| order by TimeGenerated asc
+
+
+// 6.2 Wide net across data-movement tooling - returns exactly two rows
+LinuxShellHistory_CL
+| where TimeGenerated between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 12:00:00))
+| where Computer == "gf-tg-bastion01"
+| where Command has_any ("pg_dump", "psql", "curl", "wget", "nc", "ncat", "scp", "rsync", "gzip", "tar")
+| project TimeGenerated, ShellUser, Command
+| order by TimeGenerated asc
+
+
+// 6.3 Row count stated in the agent's reasoning before any dump ran
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 12:00:00))
+| where tostring(model_response) contains "row"
+   or tostring(tool_result) contains "row"
+   or tostring(tool_args)   contains "COUNT"
+   or tostring(tool_args)   contains "count"
+| project TimeGenerated, actor, model_response, tool_name, tool_args, tool_result
+| order by TimeGenerated asc
+
+
+// 6.4 The exfiltration command
+LinuxShellHistory_CL
+| where TimeGenerated between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 12:00:00))
+| where Computer == "gf-tg-bastion01"
+| where Command has_any ("pg_dump", "curl", "wget", "scp", "rsync", "nc", "ncat")
+| project TimeGenerated, ShellUser, Command
+| order by TimeGenerated asc
+
+
+// 6.5 Corroborate from the database's own log
+//     11:40:44 database=customers          host=10.6.0.20  <- the breach
+//     11:54:58 database=greenfield_platform host=10.6.0.15  <- the baseline
+Syslog
+| where TimeGenerated between (datetime(2026-09-04 11:30:00) .. datetime(2026-09-04 12:00:00))
+| where Computer contains "gf-tg"
+| where SyslogMessage contains "database="
+| project TimeGenerated, Computer, SyslogMessage
+| order by TimeGenerated asc
+
+
+// ---------------------------------------------------------------------
+// PHASE 7 - AUTONOMY  (T1059.006)
+// ---------------------------------------------------------------------
+
+// 7.1 Isolate the hostile session from the estate's own assistant
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated),
+            Actors = make_set(actor), Inputs = make_set(user_input)
+    by session_id, RunId
+| order by FirstSeen asc
+
+
+// 7.2 The single human tasking instruction
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where session_id == "tg-4b81e0d7"
+| where isnotempty(user_input)
+| project TimeGenerated, session_id, actor, user_input
+| order by TimeGenerated asc
+
+
+// 7.3 Pace of the whole chain - 00:51:57 with no human-scale pauses
+LLMAgentLogs_CL
+| where TimeGenerated between (datetime(2026-09-04 00:00:00) .. datetime(2026-09-04 23:59:59))
+| where session_id == "tg-4b81e0d7"
+| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated)
+| extend Duration = LastSeen - FirstSeen
+
+
+// =====================================================================
+// DETECTION CANDIDATES - written after the hunt, not part of it
+// =====================================================================
+
+// D1 - Notebook kernel spawning a child interpreter
+LinuxProcess_CL
+| where ActingProcessCommandLine has_any ("marimo", "jupyter", "notebook")
+| where TargetProcessName has_any ("python", "bash", "sh", "curl", "wget")
+| where ActingProcessCommandLine has_any ("--no-token", "--ip=0.0.0.0", "--host 0.0.0.0", "--allow-root")
+| project EventStartTime, Dvc, TargetProcessName, TargetProcessId, ActingProcessCommandLine
+
+
+// D2 - IMDS access from an unexpected process
+let KnownHelpers = dynamic(["refresh", "aws-cli", "cloud-init", "amazon-ssm-agent"]);
+LinuxNetwork_CL
+| where DstIpAddr == "169.254.169.254"
+| where ActingProcessName !in (KnownHelpers)
+| summarize Connections = count(), Processes = make_set(ActingProcessName)
+    by Dvc, bin(EventStartTime, 5m)
+
+
+// D3 - One credential, many source addresses (tune the threshold)
+AWSCloudTrail
+| where isnotempty(UserIdentityAccessKeyId)
+| summarize DistinctIPs = dcount(SourceIpAddress),
+            IPs = make_set(SourceIpAddress, 20),
+            Calls = count()
+    by UserIdentityAccessKeyId, bin(TimeGenerated, 15m)
+| where DistinctIPs >= 3
+| order by DistinctIPs desc
+
+
+// D4 - Service account used for an interactive login
+let ServiceAccounts = dynamic(["deploy", "pgbackup", "svc-notebook", "ci-runner"]);
+LinuxAuth_CL
+| where EventResult == "Success"
+| where TargetUsername in (ServiceAccounts)
+| project EventStartTime, Dvc, TargetUsername, EventOriginalMessage
+
+
+// D5 - Database dump piped to a non-RFC1918 destination
+LinuxShellHistory_CL
+| where Command has_any ("pg_dump", "mysqldump", "mongodump")
+| where Command has_any ("curl", "wget", "nc ", "scp", "|")
+| extend ExternalTarget = Command matches regex @"https?://(?!10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"
+| where ExternalTarget
+| project TimeGenerated, Computer, ShellUser, Command
