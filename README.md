@@ -990,7 +990,12 @@ A dump piped anywhere off-subnet. The regex excludes RFC1918 space so the legiti
 <summary><b>Professional Report - view below </b></summary>
 [THR-2026-025-Meridian-Threat-Hunt-Report.pdf](https://github.com/user-attachments/files/32426399/THR-2026-025-Meridian-Threat-Hunt-Report.pdf)
 </details>
+<details>
+<summary><b>📄 Professional Report — View Below</b></summary>
 
+[THR-2026-025-Meridian-Threat-Hunt-Report.pdf](https://github.com/user-attachments/files/32426399/THR-2026-025-Meridian-Threat-Hunt-Report.pdf)
+
+</details>
 
 ---
 
