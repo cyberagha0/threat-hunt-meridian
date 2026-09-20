@@ -986,10 +986,7 @@ A dump piped anywhere off-subnet. The regex excludes RFC1918 space so the legiti
 - MITRE ATLAS — https://atlas.mitre.org/
 - Sysdig Threat Research Team, Pisa 2026 — LLM agents in autonomous post-exploitation *(baseline intel for this scenario)*
 - AWS — Secrets Manager CloudTrail event reference; EC2 instance metadata service (IMDSv2)
-<details>
-<summary><b>Professional Report - view below </b></summary>
-[THR-2026-025-Meridian-Threat-Hunt-Report.pdf](https://github.com/user-attachments/files/32426399/THR-2026-025-Meridian-Threat-Hunt-Report.pdf)
-</details>
+
 <details>
 <summary><b>📄 Professional Report — View Below</b></summary>
 
